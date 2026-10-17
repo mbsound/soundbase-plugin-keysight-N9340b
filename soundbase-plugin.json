@@ -10,7 +10,8 @@
   "repository": "https://github.com/mbsound/soundbase-plugin-keysight-N9340b",
   "maintainers": [
     {
-      "name": "Matt Bell"
+      "name": "Matt Bell",
+      "email": "matt@mbsound.org"
     }
   ],
   "contract": {
