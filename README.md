@@ -126,6 +126,15 @@ plugin guide this plugin was built from.
 - Stop frequency accepts up to 3.05 GHz; start accepts down to -80 MHz. The
   plugin clamps to the specified 100 kHz to 3 GHz.
 
+## What you are trusting
+
+Installing a plugin means trusting its author. SoundBase runs a plugin as a
+separate process for fault isolation, not as a security sandbox: this code
+runs with your user's privileges, like a VST or a Companion module. Everything
+it does is in this repository: it opens one TCP connection to the analyzer's
+address you give it, sends SCPI over VXI-11, and serves traces to SoundBase on
+the loopback interface. It reads and writes no files and talks to nothing else.
+
 ## Status
 
 Tested on macOS (Apple silicon), so `platforms` lists only `darwin-arm64`.
