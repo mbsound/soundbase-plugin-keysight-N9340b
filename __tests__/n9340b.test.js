@@ -10,7 +10,12 @@ import { readFileSync } from 'node:fs';
 import { HANDSHAKE_PREFIX } from '@soundbase/plugin-contract';
 import { startFakeN9340B } from '../driver/fake-n9340b.js';
 import { POINT_COUNT, RBW_HZ, parseTrace, snapToLadder } from '../driver/n9340b.js';
+import { setUsbBackend } from '../driver/usbtmc.js';
 import { PRODUCT, discoverDevices } from '../adapter.js';
+
+// LAN only: a real analyzer on this machine's USB must not show up in
+// discovery here. usbtmc.test.js covers USB against its own fake.
+setUsbBackend(null);
 
 const manifest = JSON.parse(
   readFileSync(new URL('../soundbase-plugin.json', import.meta.url), 'utf8')

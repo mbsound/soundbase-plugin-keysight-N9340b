@@ -1,5 +1,7 @@
 // A fake N9340B: a VXI-11 core-channel server speaking the SCPI subset the
-// driver uses, so the tests run with nothing on the bench.
+// driver uses, so the tests run with nothing on the bench. The instrument
+// itself (createInstrumentState / receive) is also what fake-usbtmc.js puts
+// behind its USB interface.
 //
 // It mimics the real unit's habits where they matter to the adapter: 461
 // points, RBW snapping to the 1-3-10 ladder, an attenuator that clamps at
@@ -26,12 +28,17 @@ const ERR_IO_TIMEOUT = 15;
 const VBW_HZ = [...RBW_HZ, 3_000_000];
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-export async function startFakeN9340B({
-  port = 0,
+/**
+ * The instrument behind the interface: SCPI state, error queue, the one
+ * input/output queue, the sweep-busy window. Shared by the VXI-11 fake here
+ * and the USBTMC fake in fake-usbtmc.js, so both transports drive the same
+ * instrument.
+ */
+export function createInstrumentState({
   sweepDelayMs = 20,
   identity = 'Keysight Technologies,N9340B,CN00000001,A.02.07',
 } = {}) {
-  const state = {
+  return {
     identity,
     mode: 'SA',
     measurement: 'OFF',
@@ -61,6 +68,36 @@ export async function startFakeN9340B({
       -100 + Math.sin(i / 7) * 2 + (i === Math.floor(POINT_COUNT / 2) ? 60 : 0),
     commandLog: [],
   };
+}
+
+/**
+ * Feed message bytes to the parser. Every complete line is executed, and the
+ * replies to its queries are queued as one response, as the real unit does.
+ */
+export function receive(state, text) {
+  const io = state.io;
+  io.input += text;
+  let index;
+  while ((index = io.input.indexOf('\n')) >= 0) {
+    const line = io.input.slice(0, index);
+    io.input = io.input.slice(index + 1);
+    const replies = [];
+    for (const command of line.split(';')) {
+      const out = execute(command.trim(), state);
+      if (out !== undefined) replies.push(out);
+    }
+    if (replies.length) io.output.push(`${replies.join(';')}\n`);
+  }
+}
+
+/** Device clear: drop half-received input and unread output. */
+export function clearIo(state) {
+  state.io.input = '';
+  state.io.output = [];
+}
+
+export async function startFakeN9340B({ port = 0, ...options } = {}) {
+  const state = createInstrumentState(options);
 
   const sockets = new Set();
   const server = net.createServer((socket) => {
@@ -195,18 +232,7 @@ async function handleCall(message, session, state, socket) {
       call.u32(); // flags
       const data = call.opaque();
       await waitUntilIdle(state, ioTimeout);
-      session.input += data.toString('latin1');
-      let index;
-      while ((index = session.input.indexOf('\n')) >= 0) {
-        const line = session.input.slice(0, index);
-        session.input = session.input.slice(index + 1);
-        const replies = [];
-        for (const command of line.split(';')) {
-          const out = execute(command.trim(), state);
-          if (out !== undefined) replies.push(out);
-        }
-        if (replies.length) session.output.push(`${replies.join(';')}\n`);
-      }
+      receive(state, data.toString('latin1'));
       reply(socket, call.xid, 0, ints(0, data.length));
       return;
     }
@@ -243,8 +269,7 @@ async function handleCall(message, session, state, socket) {
       return;
     }
     case DEVICE_CLEAR: {
-      session.input = '';
-      session.output = [];
+      clearIo(state);
       reply(socket, call.xid, 0, ints(0));
       return;
     }
@@ -258,7 +283,7 @@ async function handleCall(message, session, state, socket) {
 }
 
 /** The real unit answers nothing at all while it sweeps. True once idle. */
-async function waitUntilIdle(state, ioTimeout) {
+export async function waitUntilIdle(state, ioTimeout) {
   const remaining = state.busyUntil - Date.now();
   if (remaining <= 0) return true;
   await sleep(Math.min(remaining, ioTimeout));

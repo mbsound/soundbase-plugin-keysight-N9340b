@@ -4,10 +4,14 @@
 // applyConfig() echoes, what a trace looks like. driver/n9340b.js knows the
 // instrument. Nothing here touches the wire directly.
 //
-// The N9340B's LAN interface speaks VXI-11, so a unit is addressed by its IP
-// address alone (the port comes from the instrument's RPC port mapper). Users
-// either list addresses in the plugin settings, so discovery finds the units
-// that answer, or add a unit by address from the device picker.
+// Two ways to reach a unit, picked per device by its address:
+//
+//   - LAN (`net:<host>`): VXI-11, addressed by IP alone (the port comes from
+//     the instrument's RPC port mapper). Users list addresses in the plugin
+//     settings, so discovery finds the units that answer, or add a unit by
+//     address from the device picker.
+//   - USB (`usb:<serial>`): USBTMC, Windows only, with the WinUSB driver bound
+//     to the analyzer. Discovery finds these by itself.
 
 import {
   N9340B,
@@ -21,6 +25,8 @@ import {
   MAX_ATTENUATION_DB,
   SWEEP_MODES,
 } from './driver/n9340b.js';
+import { Vxi11Client } from './driver/vxi11.js';
+import { UsbtmcClient, listUsbInstruments } from './driver/usbtmc.js';
 
 export const PRODUCT = 'plugin:keysight-n9340b/n9340b';
 
@@ -44,28 +50,54 @@ const ATTENUATION_CHOICES = [
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
 /**
- * Units reachable right now, from the addresses the user listed in the plugin
- * settings. Called once a second while SoundBase enumerates and never
- * otherwise. An address with nothing on it is a normal empty result.
+ * Units reachable right now: the addresses the user listed in the plugin
+ * settings, plus any N9340B on USB. Called once a second while SoundBase
+ * enumerates and never otherwise. An address with nothing on it is a normal
+ * empty result.
  */
 export async function discoverDevices(pluginConfig = {}) {
   const addresses = parseAddresses(pluginConfig.addresses);
-  const found = await Promise.all(
-    addresses.map(async ({ host, port }) => {
-      const identity = await probe({ host, port });
-      if (!identity || !MODEL_PATTERN.test(identity.model)) return null;
-      return {
-        id: deviceId(host, port),
-        name: `${identity.model} ${identity.serial ?? ''} (${host})`.replace(
-          '  ',
-          ' '
-        ),
-        product: PRODUCT,
-        transport: { kind: 'vxi11', host, ...(port ? { port } : {}) },
-      };
-    })
+  const [lan, usb] = await Promise.all([
+    Promise.all(addresses.map(discoverLan)),
+    discoverUsb(),
+  ]);
+  return [...lan.filter(Boolean), ...usb];
+}
+
+async function discoverLan({ host, port }) {
+  const identity = await probe(
+    transportFor({ kind: 'vxi11', host, port }, { timeoutMs: 2_000 })
   );
-  return found.filter(Boolean);
+  if (!identity || !MODEL_PATTERN.test(identity.model)) return null;
+  return {
+    id: deviceId(host, port),
+    name: `${identity.model} ${identity.serial ?? ''} (${host})`.replace('  ', ' '),
+    product: PRODUCT,
+    transport: { kind: 'vxi11', host, ...(port ? { port } : {}) },
+  };
+}
+
+/**
+ * USB units, by serial number. Opening one just to ask *IDN? would fight an
+ * adapter that holds it (WinUSB allows one handle), and the vendor/product id
+ * already says N9340B, so the serial from the device descriptor is enough.
+ */
+async function discoverUsb() {
+  const units = await listUsbInstruments();
+  return units.map(({ serial }) => ({
+    id: `usb:${serial}`,
+    name: `N9340B ${serial} (USB)`,
+    product: PRODUCT,
+    transport: { kind: 'usbtmc', serial },
+  }));
+}
+
+/** A fresh, unconnected transport for an address from addressOf(). */
+function transportFor(address, { timeoutMs } = {}) {
+  const timeouts = timeoutMs ? { connectTimeoutMs: timeoutMs, ioTimeoutMs: timeoutMs } : {};
+  return address.kind === 'usbtmc'
+    ? new UsbtmcClient({ serial: address.serial, ...timeouts })
+    : new Vxi11Client({ host: address.host, port: address.port, ...timeouts });
 }
 
 export function createSpectrumAnalyzerAdapter(device, pluginConfig) {
@@ -74,9 +106,12 @@ export function createSpectrumAnalyzerAdapter(device, pluginConfig) {
 
 class N9340BAdapter {
   constructor(device) {
-    const { host, port } = addressOf(device);
-    this.host = host;
-    this.port = port;
+    this.address = addressOf(device);
+    /** for messages: the host, or "USB <serial>" */
+    this.where =
+      this.address.kind === 'usbtmc' ? `USB ${this.address.serial}` : this.address.host;
+    this.logTag =
+      this.address.kind === 'usbtmc' ? `usb:${this.address.serial}` : `net:${this.address.host}`;
     this.instrument = null;
     this.hasPreamp = false;
     this.preampOn = null; // what we last set; null until the first apply
@@ -97,26 +132,31 @@ class N9340BAdapter {
   }
 
   async open() {
-    const instrument = new N9340B({ host: this.host, port: this.port });
+    const usb = this.address.kind === 'usbtmc';
+    const instrument = new N9340B({ transport: transportFor(this.address) });
     instrument.onFatal = (err) =>
       this.onFatal?.(
         new Error(
-          `Lost the connection to the N9340B at ${this.host}: ${err?.message ?? 'connection closed'}`
+          `Lost the connection to the N9340B at ${this.where}: ${err?.message ?? 'connection closed'}`
         )
       );
     try {
       await instrument.connect();
     } catch (err) {
       throw new Error(
-        `Could not reach an N9340B at ${this.host}: ${err.message}. ` +
-          'Check the address, that the analyzer is on the same network, and that its LAN port is enabled.'
+        usb
+          ? `Could not open the N9340B on ${this.where}: ${err.message}. ` +
+              'Check the USB cable, that no other program (such as Keysight Connection Expert) has the analyzer open, ' +
+              'and that the WinUSB driver is bound to it (see the README).'
+          : `Could not reach an N9340B at ${this.where}: ${err.message}. ` +
+              'Check the address, that the analyzer is on the same network, and that its LAN port is enabled.'
       );
     }
     const identity = instrument.identity;
     if (!MODEL_PATTERN.test(identity.model ?? '')) {
       await instrument.close();
       throw new Error(
-        `${this.host} is a ${identity.manufacturer} ${identity.model}, not an N9340B-family analyzer.`
+        `${this.where} is a ${identity.manufacturer} ${identity.model}, not an N9340B-family analyzer.`
       );
     }
     this.instrument = instrument;
@@ -280,7 +320,7 @@ class N9340BAdapter {
     // one line per applied configuration in the plugin log, so "the trace
     // looks wrong" can be answered from the log instead of a bench visit
     console.log(
-      `[net:${this.host}] applied ${(effective.startHz / 1e6).toFixed(3)}-${(effective.stopHz / 1e6).toFixed(3)} MHz ` +
+      `[${this.logTag}] applied ${(effective.startHz / 1e6).toFixed(3)}-${(effective.stopHz / 1e6).toFixed(3)} MHz ` +
         `rbw=${effective.rbwHz ?? `auto(${effective.resolved.rbwHz})`} ` +
         `vbw=${effective.vbwHz ?? `auto(${effective.resolved.vbwHz})`} ` +
         `ref=${effective.refLevelDbm} dBm atten=${effective.controls.attenuation}(${effective.resolved.attenuationDb} dB) ` +
@@ -344,7 +384,7 @@ class N9340BAdapter {
           this.sweeping = false;
           this.onFatal?.(
             new Error(
-              `The N9340B at ${this.host} stopped answering during a sweep: ${err.message}`
+              `The N9340B at ${this.where} stopped answering during a sweep: ${err.message}`
             )
           );
           return;
@@ -374,7 +414,7 @@ class N9340BAdapter {
 
   #requireInstrument() {
     if (!this.instrument) {
-      throw new Error(`the N9340B at ${this.host} is not open`);
+      throw new Error(`the N9340B at ${this.where} is not open`);
     }
     return this.instrument;
   }
@@ -407,20 +447,28 @@ function deviceId(host, port) {
 }
 
 /**
- * Where this device lives. `device.config` carries the manifest's
- * deviceConfigFields; the id fallback covers a unit discovery found itself.
+ * Where this device lives: { kind: 'vxi11', host, port } or
+ * { kind: 'usbtmc', serial }. `device.config` carries the manifest's
+ * deviceConfigFields; the id fallback covers a unit discovery found itself,
+ * and is the only address a USB unit has.
  */
-function addressOf(device) {
+export function addressOf(device) {
   const config = device?.config ?? {};
   if (typeof config.host === 'string' && config.host.trim()) {
     const port = Number(config.port);
     return {
+      kind: 'vxi11',
       host: config.host.trim(),
       port: Number.isInteger(port) && port > 0 ? port : null,
     };
   }
-  const match = /^net:(.+?)(?::(\d+))?$/.exec(device?.id ?? '');
-  if (match) return { host: match[1], port: match[2] ? Number(match[2]) : null };
+  const id = device?.id ?? '';
+  const usb = /^usb:(.+)$/.exec(id);
+  if (usb) return { kind: 'usbtmc', serial: usb[1] };
+  const match = /^net:(.+?)(?::(\d+))?$/.exec(id);
+  if (match) {
+    return { kind: 'vxi11', host: match[1], port: match[2] ? Number(match[2]) : null };
+  }
   throw new Error(
     `device ${device?.id} has no address: set "IP address" in its configuration`
   );

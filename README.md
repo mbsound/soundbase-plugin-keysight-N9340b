@@ -1,7 +1,8 @@
 # SoundBase plugin: Keysight N9340B
 
 A [SoundBase](https://soundbase.app) plugin that turns a Keysight (Agilent)
-N9340B handheld spectrum analyzer into a live-scan device over the network.
+N9340B handheld spectrum analyzer into a live-scan device over the network,
+or over USB on Windows.
 Its sweeps become the trace on the plot, and SoundBase coordinates against
 them.
 
@@ -21,6 +22,15 @@ no native code.
 honours, what it clamps and snaps, how long a sweep takes, and how to read a
 trace. `adapter.js` maps that onto the SoundBase contract.
 
+USB: `driver/usbtmc.js` is a small USBTMC (USB488) client over libusb (the
+optional `usb` package). It is **Windows only**. The N9340B's configuration
+descriptor declares `bConfigurationValue` 0 and the unit rejects
+`SET_CONFIGURATION(1)`, so macOS never creates an interface for it and no
+program can open it there. A.02.07 is the final firmware, so this will not
+change. On Windows the analyzer needs the WinUSB driver bound to it (see
+below); Keysight's own USB driver from IO Libraries Suite is a different
+driver and libusb cannot use it.
+
 ## Using it
 
 1. Put the analyzer on the show network and note its address
@@ -32,6 +42,20 @@ trace. `adapter.js` maps that onto the SoundBase contract.
    - pick **Keysight N9340B (LAN)** from the device picker's "add a device"
      option and type the address.
 3. Press **Live**.
+
+### Over USB (Windows)
+
+1. Bind WinUSB to the analyzer once per PC: run [Zadig](https://zadig.akeo.ie),
+   choose **Options > List All Devices**, pick the device with USB ID
+   `0957 FFEF`, select **WinUSB** and click **Install Driver**. This replaces
+   any Keysight driver for that unit on that PC, so Keysight Connection
+   Expert will no longer see it over USB (LAN is unaffected).
+2. Plug the analyzer in. It appears in the device picker by itself as
+   **N9340B <serial> (USB)**, with the device id `usb:<serial>`, which stays
+   the same whichever port you use.
+3. Press **Live**.
+
+A unit cabled both ways shows up twice, once per transport; use either.
 
 What SoundBase can set:
 
@@ -87,7 +111,9 @@ npm run smoke       # boot as a child process and handshake, exactly as the host
 `driver/fake-n9340b.js` is a fake N9340B: a VXI-11 server speaking the SCPI
 subset the driver uses, with the real unit's quirks (461 points, RBW snapping,
 an attenuator that clamps at 51 dB, silence during a sweep, an error queue).
-The tests need no hardware.
+`driver/fake-usbtmc.js` puts the same instrument behind a fake USBTMC
+interface that checks the framing the real unit expects. The tests need no
+hardware and no `usb` package.
 
 To run against a real unit by hand:
 
@@ -132,14 +158,16 @@ Installing a plugin means trusting its author. SoundBase runs a plugin as a
 separate process for fault isolation, not as a security sandbox: this code
 runs with your user's privileges, like a VST or a Companion module. Everything
 it does is in this repository: it opens one TCP connection to the analyzer's
-address you give it, sends SCPI over VXI-11, and serves traces to SoundBase on
-the loopback interface. It reads and writes no files and talks to nothing else.
+address you give it (or, on Windows, opens the analyzer's USB interface),
+sends SCPI over VXI-11 or USBTMC, and serves traces to SoundBase on the
+loopback interface. It reads and writes no files and talks to nothing else.
 
 ## Status
 
 Tested on macOS (Apple silicon), so `platforms` lists only `darwin-arm64`.
-The code has nothing platform-specific in it; add `darwin-x64` and
-`win32-x64` once it has been run there. The N9342C/N9343C/N9344C handhelds
+The LAN code has nothing platform-specific in it; add `darwin-x64` and
+`win32-x64` once it has been run there. The USB transport is Windows only and
+has so far been tested against its fake, not a real unit. The N9342C/N9343C/N9344C handhelds
 share the dialect and are accepted by the model check, but have not been
 tried.
 

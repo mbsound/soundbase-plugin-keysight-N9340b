@@ -1,12 +1,18 @@
-// The Keysight (Agilent) N9340B handheld spectrum analyzer, over VXI-11.
+// The Keysight (Agilent) N9340B handheld spectrum analyzer.
 //
 // This file knows the instrument's SCPI dialect and its quirks; it knows
-// nothing about SoundBase. adapter.js translates between the two.
+// nothing about SoundBase, and nothing about the wire either: it is handed a
+// transport (Vxi11Client for LAN, UsbtmcClient for USB) with connect, write,
+// read, query, clear, close and onFatal. adapter.js translates between this
+// and SoundBase.
 //
 // Everything here was checked against a real N9340B (firmware A.02.07), not
 // just the programmer's guide. Where the two disagree, the instrument won:
 //
 //   - The LAN port offers VXI-11 only. There is no raw SCPI socket on 5025.
+//   - The USB port is USBTMC/USB488, but its configuration descriptor says
+//     bConfigurationValue 0 and it rejects SET_CONFIGURATION(1): usable from
+//     Windows (WinUSB), never from macOS. See usbtmc.js.
 //   - A sweep always has 461 points. There is no :SWEep:POINts command.
 //   - RBW is a 1-3-10 ladder from 300 Hz to 1 MHz; values in between snap.
 //   - The attenuator takes 0-51 dB in 1 dB steps and clamps beyond that.
@@ -19,8 +25,6 @@
 //   - :TRACe:FORMat REAL returns 461 little-endian IEEE-754 floats and a
 //     newline, no block header.
 
-import { Vxi11Client } from './vxi11.js';
-
 export const POINT_COUNT = 461;
 export const MIN_FREQUENCY_HZ = 100_000;
 export const MAX_FREQUENCY_HZ = 3_000_000_000;
@@ -32,7 +36,10 @@ export const MIN_ATTENUATION_DB = 0;
 export const MAX_ATTENUATION_DB = 51;
 export const SWEEP_MODES = ['normal', 'fast'];
 
-/** Round-trip overhead on top of the instrument's own sweep time. */
+/**
+ * Round-trip overhead on top of the instrument's own sweep time, unless the
+ * transport asks for more (USB does: `sweepOverheadMs`).
+ */
 const SWEEP_OVERHEAD_MS = 1_500;
 const SETTLE_TIMEOUT_MS = 8_000;
 
@@ -50,38 +57,36 @@ export function snapToLadder(hz, ladder = RBW_HZ) {
 }
 
 export class N9340B {
-  #vxi = null;
+  #transport;
+  #link = null;
 
-  constructor({ host, port = null, connectTimeoutMs, ioTimeoutMs } = {}) {
-    this.host = host;
-    this.port = port;
-    this.connectTimeoutMs = connectTimeoutMs ?? 3_000;
-    this.ioTimeoutMs = ioTimeoutMs ?? 5_000;
+  /** `transport`: a not-yet-connected Vxi11Client or UsbtmcClient. */
+  constructor({ transport }) {
+    this.#transport = transport;
+    /** for messages: the host, or "USB <serial>" */
+    this.where = transport.label ?? transport.host;
+    this.ioTimeoutMs = transport.ioTimeoutMs ?? 5_000;
+    this.sweepOverheadMs = transport.sweepOverheadMs ?? SWEEP_OVERHEAD_MS;
     this.identity = null;
     /** set by the owner; called when the transport dies unprompted */
     this.onFatal = null;
   }
 
   get connected() {
-    return !!this.#vxi?.connected;
+    return !!this.#link?.connected;
   }
 
   // -- connection ------------------------------------------------------------
 
   async connect() {
-    const vxi = new Vxi11Client({
-      host: this.host,
-      port: this.port,
-      connectTimeoutMs: this.connectTimeoutMs,
-      ioTimeoutMs: this.ioTimeoutMs,
-    });
-    vxi.onFatal = (err) => this.onFatal?.(err);
-    await vxi.connect();
-    this.#vxi = vxi;
+    const link = this.#transport;
+    link.onFatal = (err) => this.onFatal?.(err);
+    await link.connect();
+    this.#link = link;
     try {
       // flush whatever a previous, interrupted session left in the output
       // queue, then prove the link is in sync by reading the identity
-      await vxi.clear();
+      await link.clear();
       this.identity = await this.#identify();
     } catch (err) {
       await this.close();
@@ -96,7 +101,7 @@ export class N9340B {
       .map((s) => s.trim());
     if (!model) {
       throw new Error(
-        `${this.host} answered *IDN? with "${reply}", which is not an instrument identity`
+        `${this.where} answered *IDN? with "${reply}", which is not an instrument identity`
       );
     }
     return { manufacturer, model, serial, firmware };
@@ -104,18 +109,18 @@ export class N9340B {
 
   /** Destroy the link. Never throws. */
   async close() {
-    const vxi = this.#vxi;
-    this.#vxi = null;
-    if (vxi) await vxi.close();
+    const link = this.#link;
+    this.#link = null;
+    if (link) await link.close();
   }
 
   // -- primitives ------------------------------------------------------------
 
   #require() {
-    if (!this.#vxi?.connected) {
-      throw new Error(`no connection to the N9340B at ${this.host}`);
+    if (!this.#link?.connected) {
+      throw new Error(`no connection to the N9340B at ${this.where}`);
     }
-    return this.#vxi;
+    return this.#link;
   }
 
   async #write(command) {
@@ -331,7 +336,7 @@ export class N9340B {
   async sweep({ sweepTimeMs = 0 } = {}) {
     const timeoutMs = Math.max(
       this.ioTimeoutMs,
-      Math.round(sweepTimeMs * 1.5) + SWEEP_OVERHEAD_MS
+      Math.round(sweepTimeMs * 1.5) + this.sweepOverheadMs
     );
     const done = await this.#query(':INIT:IMM;*OPC?', timeoutMs);
     if (done !== '1') {
@@ -342,9 +347,9 @@ export class N9340B {
 
   /** Read trace 1 as 461 dBm values, whichever format the instrument is in. */
   async readTrace() {
-    const vxi = this.#require();
-    await vxi.write(':TRAC1:DATA?');
-    const buf = await vxi.read({ timeoutMs: this.ioTimeoutMs });
+    const link = this.#require();
+    await link.write(':TRAC1:DATA?');
+    const buf = await link.read({ timeoutMs: this.ioTimeoutMs });
     return parseTrace(buf);
   }
 }
@@ -371,16 +376,11 @@ export function parseTrace(buf) {
 }
 
 /**
- * Is there an N9340B at this address? For discovery: quick, quiet, never
- * throws. Returns the identity or null.
+ * Is there an N9340B on the other end of this transport? For discovery:
+ * quick, quiet, never throws. Returns the identity or null.
  */
-export async function probe({ host, port = null, timeoutMs = 2_000 }) {
-  const instrument = new N9340B({
-    host,
-    port,
-    connectTimeoutMs: timeoutMs,
-    ioTimeoutMs: timeoutMs,
-  });
+export async function probe(transport) {
+  const instrument = new N9340B({ transport });
   try {
     await instrument.connect();
     return instrument.identity;

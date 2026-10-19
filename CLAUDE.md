@@ -13,6 +13,10 @@ was checked on a real unit (firmware A.02.07); its header comment lists where
 the instrument disagrees with the programmer's guide. README.md has the user
 view.
 
+It can also reach the unit over USB (USBTMC) on Windows only; `adapter.js`
+picks the transport per device from its address (`net:<host>` or
+`usb:<serial>`).
+
 A **SoundBase plugin**: a small network service that provides one or more
 devices to SoundBase over a versioned HTTP contract. SoundBase spawns it as a
 child process and supervises it — handshake, health, crash-restart, teardown.
@@ -31,8 +35,11 @@ soundbase-plugin.json   identity, the N9340B product, config fields
 main.js                 shell bootstrap — never edit
 adapter.js              the SoundBase contract side: open/applyConfig/sweep
 driver/vxi11.js         a minimal VXI-11 (ONC RPC) client over TCP
-driver/n9340b.js        the instrument: SCPI dialect, quirks, trace parsing
+driver/usbtmc.js        a minimal USBTMC client over libusb (Windows only)
+driver/n9340b.js        the instrument: SCPI dialect, quirks, trace parsing;
+                        handed either transport, builds neither
 driver/fake-n9340b.js   a fake N9340B (VXI-11 server) for the tests
+driver/fake-usbtmc.js   the same fake instrument behind a fake USBTMC backend
 __tests__/              contract tests, driven through the real shell against the fake
 docs/                   the SoundBase plugin guide set this was built from
 scripts/                doctor, smoke, manifest, rename, bump-version, release, pack-release

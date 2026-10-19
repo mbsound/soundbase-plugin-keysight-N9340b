@@ -41,7 +41,7 @@
       "model": {
         "id": "n9340b",
         "name": "N9340B",
-        "displayName": "Keysight N9340B (LAN)"
+        "displayName": "Keysight N9340B"
       },
       "family": {
         "id": "keysight-handheld-sa",
@@ -61,7 +61,7 @@
       "id": "addresses",
       "type": "textinput",
       "label": "Analyzer addresses",
-      "help": "IP addresses or hostnames of N9340B units on the show network, separated by commas. Each one is probed while SoundBase is looking for devices. You can also add a unit by address from the device picker instead."
+      "help": "IP addresses or hostnames of N9340B units on the show network, separated by commas. Each one is probed while SoundBase is looking for devices. You can also add a unit by address from the device picker instead. On Windows, units connected by USB are found without an address, once the WinUSB driver is bound to them (see the README); USB is not available on macOS."
     }
   ],
   "deviceConfigFields": [

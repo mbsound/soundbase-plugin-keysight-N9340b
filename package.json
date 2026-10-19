@@ -32,5 +32,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mbsound/soundbase-plugin-keysight-N9340b.git"
+  },
+  "optionalDependencies": {
+    "usb": "^2.19.1"
   }
 }
