@@ -39,8 +39,9 @@ keeps working if the driver changes.
 
 The N9340B's configuration descriptor declares `bConfigurationValue` 0 and the
 unit rejects `SET_CONFIGURATION(1)`, so macOS never creates an interface for
-it and no program can open it there; libusb ignores it on every OS for the
-same reason. A.02.07 is the final firmware, so this will not change. Windows'
+it: a program can send it control requests but cannot open its bulk
+endpoints, which USBTMC needs. libusb ignores it on every OS for the same
+reason. A.02.07 is the final firmware, so this will not change. Windows'
 own USB stack does not mind.
 
 ## Using it
@@ -185,10 +186,11 @@ loopback interface. It reads and writes no files and talks to nothing else.
 
 ## Status
 
-Tested on macOS (Apple silicon), so `platforms` lists only `darwin-arm64`.
-The LAN code has nothing platform-specific in it; add `darwin-x64` and
-`win32-x64` once it has been run there. The USB transport is Windows only and
-has so far been tested against its fake, not a real unit. The N9342C/N9343C/N9344C handhelds
+`platforms` lists `darwin-arm64` and `win32-x64`, the two it has been run on.
+The LAN code has nothing platform-specific in it; add `darwin-x64` once it has
+been run there. The USB transport is Windows only and has been tested with a
+real unit (firmware A.02.07) on native x64 Windows 11, through both WinUSB and
+Keysight's driver. The N9342C/N9343C/N9344C handhelds
 share the dialect and are accepted by the model check, but have not been
 tried.
 
