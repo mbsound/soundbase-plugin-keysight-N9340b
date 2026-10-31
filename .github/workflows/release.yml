@@ -113,6 +113,26 @@ jobs:
       - name: Drop dev dependencies
         run: npm prune --omit=dev --no-save
 
+      # USB on Windows calls winusb.dll and VISA through koffi, whose native
+      # binary is a per-platform package that npm installs only for the
+      # platform it runs on. This job runs on Linux and the zip is installed
+      # on Windows too, so unpack koffi's win32-x64 build beside the one npm
+      # chose, at the version the lockfile pinned. Unpacked rather than
+      # installed, so npm never rewrites the tree or the lockfile. macOS needs
+      # no koffi: USB is not available there and the plugin never loads it.
+      - name: Add koffi's Windows binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('koffi/package.json').version")
+          DEST=node_modules/@koromix/koffi-win32-x64
+          TARBALL=$(npm pack "@koromix/koffi-win32-x64@$VERSION" --silent)
+          mkdir -p "$DEST"
+          tar -xzf "$TARBALL" -C "$DEST" --strip-components=1
+          rm "$TARBALL"
+          test -f "$DEST/win32_x64/koffi.node"
+          echo "::notice::koffi $VERSION win32-x64 binary added"
+
       # Packs, boots the packed folder the way the installer's probe does, and
       # refuses anything the Lab would reject. On a tag it also insists the
       # manifest version matches the tag.
