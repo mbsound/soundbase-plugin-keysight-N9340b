@@ -1,7 +1,7 @@
 {
   "name": "soundbase-plugin-keysight-n9340b",
-  "version": "0.1.0",
-  "description": "SoundBase plugin for the Keysight N9340B handheld spectrum analyzer over VXI-11 (LAN), or USBTMC over WinUSB on Windows.",
+  "version": "0.2.0",
+  "description": "SoundBase plugin for the Keysight N9340B handheld spectrum analyzer over VXI-11 (LAN), or USB on Windows (WinUSB or Keysight IO Libraries).",
   "license": "BUSL-1.1",
   "type": "module",
   "main": "main.js",

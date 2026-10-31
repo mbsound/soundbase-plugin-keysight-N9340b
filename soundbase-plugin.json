@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "keysight-n9340b",
   "name": "Keysight N9340B",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "platforms": [
     "darwin-arm64",
