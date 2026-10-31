@@ -7,7 +7,14 @@ Its sweeps become the trace on the plot, and SoundBase coordinates against
 them.
 
 Developed and tested against an N9340B running firmware A.02.07 with the
-preamp option (PA3), over its LAN port.
+preamp option (PA3), over its LAN port and over USB on Windows.
+
+**Other Keysight analyzers** (the N9342C and the rest of the handheld family,
+or any instrument that identifies as Keysight or Agilent) are offered too, and
+driven with the same commands. They are untested: the plugin learns each
+unit's point count and frequency range from the unit itself, and SoundBase
+shows a notice that the model is untested. Settings a model does not support
+may be refused; the plugin reports those as warnings rather than failing.
 
 ## How it talks to the analyzer
 

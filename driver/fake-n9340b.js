@@ -37,9 +37,17 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 export function createInstrumentState({
   sweepDelayMs = 20,
   identity = 'Keysight Technologies,N9340B,CN00000001,A.02.07',
+  // another model: its points per sweep, and its frequency limits as
+  // :SENS:FREQ:STOP? MAX and :SENS:FREQ:STAR? MIN report them
+  pointCount = POINT_COUNT,
+  minHz = -80e6,
+  maxHz = 3.05e9,
 } = {}) {
   return {
     identity,
+    pointCount,
+    minHz,
+    maxHz,
     mode: 'SA',
     measurement: 'OFF',
     continuous: true,
@@ -350,13 +358,13 @@ function execute(raw, state) {
       state.busyUntil = Date.now() + state.sweepDelayMs;
       return undefined;
     case 'SENS:FREQ:STAR':
-      if (isQuery) return sci(state.startHz);
-      state.startHz = clamp(number(arg), -80e6, 3.08e9);
+      if (isQuery) return sci(/^MIN/i.test(arg) ? state.minHz : state.startHz);
+      state.startHz = clamp(number(arg), state.minHz, state.maxHz + 0.03e9);
       if (state.stopHz - state.startHz < 1000) state.stopHz = state.startHz + 1000;
       return undefined;
     case 'SENS:FREQ:STOP':
-      if (isQuery) return sci(state.stopHz);
-      state.stopHz = clamp(number(arg), -80e6, 3.05e9);
+      if (isQuery) return sci(/^MAX/i.test(arg) ? state.maxHz : state.stopHz);
+      state.stopHz = clamp(number(arg), state.minHz, state.maxHz);
       if (state.stopHz - state.startHz < 1000) state.stopHz = state.startHz + 1000;
       return undefined;
     case 'SENS:BAND:RES':
@@ -428,9 +436,9 @@ function execute(raw, state) {
     case 'TRAC1:DATA':
     case 'TRAC1': {
       if (!isQuery) return undefined;
-      const values = Array.from({ length: POINT_COUNT }, (_, i) => state.trace(i));
+      const values = Array.from({ length: state.pointCount }, (_, i) => state.trace(i));
       if (state.format === 'REAL') {
-        const buf = Buffer.alloc(POINT_COUNT * 4);
+        const buf = Buffer.alloc(state.pointCount * 4);
         values.forEach((v, i) => buf.writeFloatLE(v, i * 4));
         return buf.toString('latin1');
       }

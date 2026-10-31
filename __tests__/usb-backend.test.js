@@ -68,17 +68,18 @@ test('a unit is routed by the driver bound to it', () => {
 
 test('discovery lists every unit it has a route to, and only those', async () => {
   const units = () => [
-    { serial: 'CN00000001', service: 'WINUSB', path: 'a' },
-    { serial: 'CN00000002', service: 'Usbtmc', path: 'b' },
-    { serial: 'CN00000003', service: null, path: 'c' },
+    { serial: 'CN00000001', model: 'N9340B', service: 'WINUSB', path: 'a' },
+    // another Keysight model: offered the same way, named by its product string
+    { serial: 'CN00000002', model: 'N9342C', service: 'Usbtmc', path: 'b' },
+    { serial: 'CN00000003', model: 'N9340B', service: null, path: 'c' },
   ];
   assert.deepEqual(await backendWith({ units }).backend.list(), [
-    { serial: 'CN00000001' },
-    { serial: 'CN00000002' },
+    { serial: 'CN00000001', model: 'N9340B' },
+    { serial: 'CN00000002', model: 'N9342C' },
   ]);
   // without VISA, a unit on Keysight's driver is out of reach
   assert.deepEqual(await backendWith({ units, visa: false }).backend.list(), [
-    { serial: 'CN00000001' },
+    { serial: 'CN00000001', model: 'N9340B' },
   ]);
 });
 

@@ -10,15 +10,20 @@
 //     the instrument's RPC port mapper). Users list addresses in the plugin
 //     settings, so discovery finds the units that answer, or add a unit by
 //     address from the device picker.
-//   - USB (`usb:<serial>`): USBTMC, Windows only, with the WinUSB driver bound
-//     to the analyzer. Discovery finds these by itself.
+//   - USB (`usb:<serial>`): USBTMC, Windows only, through WinUSB or Keysight's
+//     own driver. Discovery finds these by itself.
+//
+// Built and checked on the N9340B, but not limited to it: any Keysight (or
+// Agilent) analyzer is offered and driven with the same commands, with a
+// warning that its model is untested. Its point count and frequency limits
+// come from the unit itself (learnLimits() in driver/n9340b.js).
 
 import {
   N9340B,
   probe,
+  isKeysight,
+  isN9340B,
   POINT_COUNT,
-  MIN_FREQUENCY_HZ,
-  MAX_FREQUENCY_HZ,
   RBW_HZ,
   MIN_REF_LEVEL_DBM,
   MAX_REF_LEVEL_DBM,
@@ -30,9 +35,6 @@ import { Vxi11Client } from './driver/vxi11.js';
 import { UsbtmcClient, listUsbInstruments } from './driver/usbtmc.js';
 
 export const PRODUCT = 'plugin:keysight-n9340b/n9340b';
-
-/** Models that share the N9340B's SCPI dialect closely enough to drive. */
-const MODEL_PATTERN = /^N93\d\d[A-Z]?$/i;
 
 /** Above this, a live view is not live; tell the user why. */
 const SLOW_SWEEP_WARNING_MS = 10_000;
@@ -59,7 +61,7 @@ const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
 /**
  * Units reachable right now: the addresses the user listed in the plugin
- * settings, plus any N9340B on USB. Called once a second while SoundBase
+ * settings, plus any Keysight analyzer on USB. Called once a second while SoundBase
  * enumerates and never otherwise. An address with nothing on it is a normal
  * empty result.
  */
@@ -76,7 +78,7 @@ async function discoverLan({ host, port }) {
   const identity = await probe(
     transportFor({ kind: 'vxi11', host, port }, { timeoutMs: 2_000 })
   );
-  if (!identity || !MODEL_PATTERN.test(identity.model)) return null;
+  if (!identity || !isKeysight(identity)) return null;
   return {
     id: deviceId(host, port),
     name: `${identity.model} ${identity.serial ?? ''} (${host})`.replace('  ', ' '),
@@ -87,14 +89,15 @@ async function discoverLan({ host, port }) {
 
 /**
  * USB units, by serial number. Opening one just to ask *IDN? would fight an
- * adapter that holds it (WinUSB allows one handle), and the vendor/product id
- * already says N9340B, so the serial from the device descriptor is enough.
+ * adapter that holds it (WinUSB allows one handle), so the name comes from
+ * the product string the device reports over USB ("N9340B", "N9342C"), and
+ * the vendor id already says Keysight.
  */
 async function discoverUsb() {
   const units = await listUsbInstruments();
-  return units.map(({ serial }) => ({
+  return units.map(({ serial, model }) => ({
     id: `usb:${serial}`,
-    name: `N9340B ${serial} (USB)`,
+    name: `${model || 'Keysight analyzer'} ${serial} (USB)`,
     product: PRODUCT,
     transport: { kind: 'usbtmc', serial },
   }));
@@ -145,7 +148,7 @@ class N9340BAdapter {
     instrument.onFatal = (err) =>
       this.onFatal?.(
         new Error(
-          `Lost the connection to the N9340B at ${this.where}: ${err?.message ?? 'connection closed'}`
+          `Lost the connection to the analyzer at ${this.where}: ${err?.message ?? 'connection closed'}`
         )
       );
     try {
@@ -153,20 +156,22 @@ class N9340BAdapter {
     } catch (err) {
       throw new Error(
         usb
-          ? `Could not open the N9340B on ${this.where}: ${err.message}. ` +
+          ? `Could not open the analyzer on ${this.where}: ${err.message}. ` +
               'Check the USB cable and that no other program (such as Keysight Connection Expert) is using the analyzer. ' +
               'If it keeps failing, unplug the analyzer\'s USB cable and plug it back in.'
-          : `Could not reach an N9340B at ${this.where}: ${err.message}. ` +
+          : `Could not reach an analyzer at ${this.where}: ${err.message}. ` +
               'Check the address, that the analyzer is on the same network, and that its LAN port is enabled.'
       );
     }
     const identity = instrument.identity;
-    if (!MODEL_PATTERN.test(identity.model ?? '')) {
+    if (!isKeysight(identity)) {
       await instrument.close();
       throw new Error(
-        `${this.where} is a ${identity.manufacturer} ${identity.model}, not an N9340B-family analyzer.`
+        `${this.where} is a ${identity.manufacturer} ${identity.model}, not a Keysight analyzer.`
       );
     }
+    // driven like an N9340B; for anything else, say so where the user looks
+    this.untestedModel = isN9340B(identity) ? null : identity.model;
     this.instrument = instrument;
 
     await instrument.prepare();
@@ -202,10 +207,13 @@ class N9340BAdapter {
         default: '1',
         choices: RESOLUTIONS.map((n) => ({
           id: String(n),
-          label: n === 1 ? `Standard (${pointsFor(n)} points)` : `${n}× (${pointsFor(n)} points)`,
+          label:
+            n === 1
+              ? `Standard (${pointsFor(n, instrument.pointCount)} points)`
+              : `${n}× (${pointsFor(n, instrument.pointCount)} points)`,
         })),
         help:
-          `The analyzer measures ${POINT_COUNT} points per sweep, whatever the span. Higher resolutions sweep the span ` +
+          `The analyzer measures ${instrument.pointCount} points per sweep, whatever the span. Higher resolutions sweep the span ` +
           'in that many slices and join them, for finer point spacing (and a matching auto RBW), at that many times the sweep time.',
       },
     ];
@@ -230,8 +238,9 @@ class N9340BAdapter {
 
     return {
       capabilities: {
-        minFrequencyHz: MIN_FREQUENCY_HZ,
-        maxFrequencyHz: MAX_FREQUENCY_HZ,
+        // learned from the unit at prepare(): the N9340B's own for an N9340B
+        minFrequencyHz: instrument.minFrequencyHz,
+        maxFrequencyHz: instrument.maxFrequencyHz,
         rbwHz: [...RBW_HZ],
         minRefLevelDbm: MIN_REF_LEVEL_DBM,
         maxRefLevelDbm: MAX_REF_LEVEL_DBM,
@@ -261,7 +270,7 @@ class N9340BAdapter {
     const instrument = this.#requireInstrument();
     const previous = this.effective ?? { controls: {} };
     const effective = {
-      pointCount: POINT_COUNT,
+      pointCount: instrument.pointCount,
       controls: { ...previous.controls },
       resolved: {},
     };
@@ -284,7 +293,7 @@ class N9340BAdapter {
       effective.stopHz = previous.stopHz;
     }
 
-    // -- resolution: the span in slices of POINT_COUNT points each. The
+    // -- resolution: the span in slices of the unit's point count each. The
     // analyzer is left on the first slice, so an auto RBW couples to a slice
     // and the sweep time read below is one slice's.
     const wantSlices =
@@ -293,7 +302,7 @@ class N9340BAdapter {
         : Number(previous.controls.resolution ?? 1);
     this.segments = segmentsFor(effective.startHz, effective.stopHz, wantSlices);
     effective.controls.resolution = String(this.segments.length);
-    effective.pointCount = pointsFor(this.segments.length);
+    effective.pointCount = pointsFor(this.segments.length, instrument.pointCount);
     if (this.segments.length > 1) {
       const first = this.segments[0];
       await instrument.setFrequencyRange(first.startHz, first.stopHz);
@@ -374,6 +383,15 @@ class N9340BAdapter {
 
   #reportWarnings(errors) {
     const warnings = [];
+    if (this.untestedModel) {
+      warnings.push({
+        id: 'untested-model',
+        severity: 'info',
+        message:
+          `This plugin was built and tested on the N9340B. The ${this.untestedModel} is driven with the same commands; ` +
+          'settings it does not support may be refused or ignored.',
+      });
+    }
     const slices = this.segments?.length ?? 1;
     const traceMs = this.sweepTimeMs * slices;
     if (traceMs > SLOW_SWEEP_WARNING_MS) {
@@ -427,7 +445,7 @@ class N9340BAdapter {
           this.sweeping = false;
           this.onFatal?.(
             new Error(
-              `The N9340B at ${this.where} stopped answering during a sweep: ${err.message}`
+              `The analyzer at ${this.where} stopped answering during a sweep: ${err.message}`
             )
           );
           return;
@@ -482,14 +500,14 @@ class N9340BAdapter {
 
   #requireInstrument() {
     if (!this.instrument) {
-      throw new Error(`the N9340B at ${this.where} is not open`);
+      throw new Error(`the analyzer at ${this.where} is not open`);
     }
     return this.instrument;
   }
 }
 
 /** How many points a trace of this many slices has: neighbours share an edge. */
-export const pointsFor = (slices) => slices * (POINT_COUNT - 1) + 1;
+export const pointsFor = (slices, points = POINT_COUNT) => slices * (points - 1) + 1;
 
 /**
  * The span cut into `slices` equal parts, as [{ startHz, stopHz }]. Clamped

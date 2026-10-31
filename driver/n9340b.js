@@ -25,7 +25,14 @@
 //   - :TRACe:FORMat REAL returns 461 little-endian IEEE-754 floats, no block
 //     header, then a newline over LAN. Over USB there is no newline: exactly
 //     1844 bytes (seen through both Keysight VISA and raw WinUSB).
+//
+// Other Keysight analyzers (N9342C and the rest of the handheld family, or
+// anything else that answers *IDN? as Keysight or Agilent) are driven with
+// the same commands, untested. Rather than assume the N9340B's 461 points and
+// 3 GHz, prepare() learns each unit's point count from a trace and, for any
+// model but the N9340B, asks for its frequency limits; see learnLimits().
 
+/** The N9340B's point count, and what a unit is assumed to have until a trace says otherwise. */
 export const POINT_COUNT = 461;
 export const MIN_FREQUENCY_HZ = 100_000;
 export const MAX_FREQUENCY_HZ = 3_000_000_000;
@@ -45,6 +52,12 @@ const SWEEP_OVERHEAD_MS = 1_500;
 const SETTLE_TIMEOUT_MS = 8_000;
 
 export const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/** Keysight, or Agilent before the 2014 split: the makers this driver will talk to. */
+export const isKeysight = (identity) => /keysight|agilent/i.test(identity?.manufacturer ?? '');
+
+/** The model every limit and quirk in this file was checked on. */
+export const isN9340B = (identity) => /^N9340B?$/i.test(identity?.model ?? '');
 
 /** Nearest value in a 1-3-10 ladder, compared on a log scale. */
 export function snapToLadder(hz, ladder = RBW_HZ) {
@@ -69,6 +82,10 @@ export class N9340B {
     this.ioTimeoutMs = transport.ioTimeoutMs ?? 5_000;
     this.sweepOverheadMs = transport.sweepOverheadMs ?? SWEEP_OVERHEAD_MS;
     this.identity = null;
+    /** what this unit accepts; the N9340B's until prepare() learns otherwise */
+    this.pointCount = POINT_COUNT;
+    this.minFrequencyHz = MIN_FREQUENCY_HZ;
+    this.maxFrequencyHz = MAX_FREQUENCY_HZ;
     /** set by the owner; called when the transport dies unprompted */
     this.onFatal = null;
   }
@@ -119,7 +136,7 @@ export class N9340B {
 
   #require() {
     if (!this.#link?.connected) {
-      throw new Error(`no connection to the N9340B at ${this.where}`);
+      throw new Error(`no connection to the analyzer at ${this.where}`);
     }
     return this.#link;
   }
@@ -190,6 +207,7 @@ export class N9340B {
     await this.#write(':SENS:AVER:TRAC1 OFF');
     // sweep time must couple to span and RBW, or narrow RBWs read "Meas Uncal"
     await this.#write(':SENS:SWE:TIME:AUTO 1');
+    await this.learnLimits();
     await this.#write('*CLS');
   }
 
@@ -206,11 +224,42 @@ export class N9340B {
   }
 
   /** Set start/stop and return what the instrument settled on. */
+  /**
+   * What this unit accepts, as far as it says. The point count is read from
+   * the trace it already holds (no sweep), so a model with a different
+   * count is simply believed. The N9340B keeps the frequency limits checked
+   * on it; any other model is asked for its own (SCPI MIN/MAX), keeping the
+   * N9340B's where it does not answer. Anything this sends that a unit
+   * rejects lands in its error queue, which prepare() clears straight after.
+   */
+  async learnLimits() {
+    try {
+      const trace = await this.readTrace({ expectedPoints: null });
+      if (trace.length >= 2) this.pointCount = trace.length;
+    } catch {
+      // keep the default; the first sweep will say if it is wrong
+    }
+    if (isN9340B(this.identity)) return;
+    const asked = async (command) => {
+      try {
+        return await this.#queryNumber(command);
+      } catch {
+        return null;
+      }
+    };
+    const max = await asked(':SENS:FREQ:STOP? MAX');
+    const min = await asked(':SENS:FREQ:STAR? MIN');
+    if (max !== null && max > MIN_SPAN_HZ) this.maxFrequencyHz = max;
+    if (min !== null && min >= 0 && min < this.maxFrequencyHz) this.minFrequencyHz = min;
+  }
+
   async setFrequencyRange(startHz, stopHz) {
-    let start = clamp(Math.round(startHz), MIN_FREQUENCY_HZ, MAX_FREQUENCY_HZ);
-    let stop = clamp(Math.round(stopHz), MIN_FREQUENCY_HZ, MAX_FREQUENCY_HZ);
+    const lo = this.minFrequencyHz;
+    const hi = this.maxFrequencyHz;
+    let start = clamp(Math.round(startHz), lo, hi);
+    let stop = clamp(Math.round(stopHz), lo, hi);
     if (stop - start < MIN_SPAN_HZ) {
-      stop = Math.min(MAX_FREQUENCY_HZ, start + MIN_SPAN_HZ);
+      stop = Math.min(hi, start + MIN_SPAN_HZ);
       start = stop - MIN_SPAN_HZ;
     }
     // stop first when moving up, start first when moving down, so the two
@@ -357,39 +406,46 @@ export class N9340B {
   }
 
   /** Read trace 1 as 461 dBm values, whichever format the instrument is in. */
-  async readTrace() {
+  /** The current trace in dBm; as many points as the unit was found to have, unless told otherwise. */
+  async readTrace({ expectedPoints = this.pointCount } = {}) {
     const link = this.#require();
     await link.write(':TRAC1:DATA?');
     const buf = await link.read({ timeoutMs: this.ioTimeoutMs });
-    return parseTrace(buf);
+    return parseTrace(buf, expectedPoints);
   }
 }
 
 /**
- * A trace in either format. REAL is 461 little-endian float32, with a newline
- * after them over LAN and none over USB; ASCii is comma-separated
- * `-9.528974152E+01` values.
+ * A trace in either format. REAL is little-endian float32s (461 on the
+ * N9340B), with a newline after them over LAN and none over USB; ASCii is
+ * comma-separated `-9.528974152E+01` values. `expectedPoints` rejects a
+ * trace of any other length, which is how a truncated read shows itself;
+ * null accepts whatever the unit sent.
  */
-export function parseTrace(buf) {
-  const binaryLength = POINT_COUNT * 4;
-  if (buf.length === binaryLength || buf.length === binaryLength + 1) {
-    const out = new Array(POINT_COUNT);
-    for (let i = 0; i < POINT_COUNT; i++) out[i] = buf.readFloatLE(i * 4);
-    return out;
-  }
+export function parseTrace(buf, expectedPoints = POINT_COUNT) {
   const text = buf.toString('latin1').trim();
-  const values = text.split(',').map(Number);
-  if (values.length !== POINT_COUNT || values.some((v) => !Number.isFinite(v))) {
+  let values;
+  if (text.includes(',') && /^[-+\d.eE,\s]+$/.test(text)) {
+    values = text.split(',').map(Number);
+  } else {
+    const body = buf.length % 4 === 1 && buf[buf.length - 1] === 0x0a ? buf.subarray(0, -1) : buf;
+    if (body.length % 4 === 0 && body.length >= 8) {
+      values = Array.from({ length: body.length / 4 }, (_, i) => body.readFloatLE(i * 4));
+    }
+  }
+  const count = values?.length ?? 0;
+  if (!values || values.some((v) => !Number.isFinite(v)) || (expectedPoints && count !== expectedPoints)) {
     throw new Error(
-      `trace data was ${buf.length} bytes / ${values.length} values, expected ${POINT_COUNT} points`
+      `trace data was ${buf.length} bytes / ${count} values` +
+        (expectedPoints ? `, expected ${expectedPoints} points` : ', not a trace')
     );
   }
   return values;
 }
 
 /**
- * Is there an N9340B on the other end of this transport? For discovery:
- * quick, quiet, never throws. Returns the identity or null.
+ * Is there a Keysight analyzer on the other end of this transport? For
+ * discovery: quick, quiet, never throws. Returns the identity or null.
  */
 export async function probe(transport) {
   const instrument = new N9340B({ transport });

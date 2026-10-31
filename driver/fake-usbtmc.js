@@ -40,7 +40,8 @@ export function createFakeUsbBackend({
 
   const backend = {
     async list() {
-      return usb.attached ? [{ serial }] : [];
+      // the model is the product string the device reports over USB
+      return usb.attached ? [{ serial, model: state.identity.split(',')[1] ?? null }] : [];
     },
     async open(want) {
       if (!usb.attached || want !== serial) {

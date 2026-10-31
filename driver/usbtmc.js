@@ -27,7 +27,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 export const VENDOR_ID = 0x0957;
-export const PRODUCT_ID = 0xffef;
+// any product id: every Keysight USBTMC instrument is offered, not only the N9340B
 
 /** Where the WinUSB backend is tried at all. Elsewhere USB reports no units. */
 export const USB_PLATFORMS = ['win32'];
@@ -161,17 +161,17 @@ export function createUsbBackend({
 
   return {
     async list() {
-      return (await units()).filter((u) => route(u).route).map(({ serial }) => ({ serial }));
+      return (await units()).filter((u) => route(u).route).map(({ serial, model }) => ({ serial, model: model ?? null }));
     },
 
     async open(serial, { timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS } = {}) {
       const unit = (await units()).find((u) => u.serial === serial);
-      if (!unit) throw new UsbError('NO_DEVICE', `no N9340B with serial ${serial} on USB`);
+      if (!unit) throw new UsbError('NO_DEVICE', `no Keysight instrument with serial ${serial} on USB`);
       const { route: way, reason } = route(unit);
       if (!way) {
         throw new UsbError(
           'IO',
-          `the N9340B ${serial} cannot be used over USB: ${reason}. ` +
+          `the analyzer ${serial} cannot be used over USB: ${reason}. ` +
             'Bind WinUSB to it, or install Keysight IO Libraries Suite (see the README)'
         );
       }
@@ -367,7 +367,7 @@ export class UsbtmcClient {
     const b = await getBackend();
     if (!b) {
       throw new Error(
-        `USB is not available on ${process.platform}-${process.arch}; connect the N9340B over LAN`
+        `USB is not available on ${process.platform}-${process.arch}; connect the analyzer over LAN`
       );
     }
     const pipe = await b.open(this.serial, { timeoutMs: this.connectTimeoutMs });
@@ -386,7 +386,7 @@ export class UsbtmcClient {
   }
 
   #requirePipe() {
-    if (!this.#pipe) throw new Error(`no USB link to the N9340B ${this.serial}`);
+    if (!this.#pipe) throw new Error(`no USB link to the analyzer ${this.serial}`);
     return this.#pipe;
   }
 
@@ -480,7 +480,7 @@ export class UsbtmcClient {
       if (err?.code === 'TIMEOUT' || err?.code === 'STALL') {
         await this.#recover();
         throw new Error(
-          err.code === 'TIMEOUT' ? 'the N9340B did not answer in time over USB' : err.message
+          err.code === 'TIMEOUT' ? 'the analyzer did not answer in time over USB' : err.message
         );
       }
       throw err;

@@ -23,8 +23,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import koffi from 'koffi';
 
+/** Keysight (formerly Agilent). Any product id: not only the N9340B's 0xFFEF. */
 export const VENDOR_ID = 0x0957;
-export const PRODUCT_ID = 0xffef;
 
 // --- types -------------------------------------------------------------------
 
@@ -92,6 +92,10 @@ const SetupDiGetDeviceInstanceIdW = setupapi.func(
 const SetupDiGetDeviceRegistryPropertyW = setupapi.func(
   'bool SetupDiGetDeviceRegistryPropertyW(void *set, SP_DEVINFO_DATA *info, uint32_t property, _Out_ uint32_t *type, _Inout_ uint8_t *buffer, uint32_t size, _Out_ uint32_t *required)'
 );
+koffi.struct('DEVPROPKEY', { fmtid: GUID, pid: 'uint32_t' });
+const SetupDiGetDevicePropertyW = setupapi.func(
+  'bool SetupDiGetDevicePropertyW(void *set, SP_DEVINFO_DATA *info, const DEVPROPKEY *key, _Out_ uint32_t *type, _Inout_ uint8_t *buffer, uint32_t size, _Out_ uint32_t *required, uint32_t flags)'
+);
 const SetupDiDestroyDeviceInfoList = setupapi.func('bool SetupDiDestroyDeviceInfoList(void *set)');
 
 const CreateFileW = kernel32.func(
@@ -131,7 +135,21 @@ const GUID_DEVINTERFACE_USB_DEVICE = {
 };
 const DIGCF_PRESENT = 0x02;
 const DIGCF_DEVICEINTERFACE = 0x10;
+const SPDRP_COMPATIBLEIDS = 0x02;
 const SPDRP_SERVICE = 0x04;
+// the product string the device itself reports (iProduct), e.g. "N9340B";
+// unlike the friendly name, a bound driver does not replace it
+const DEVPKEY_Device_BusReportedDeviceDesc = {
+  fmtid: {
+    Data1: 0x540b947e,
+    Data2: 0x8b40,
+    Data3: 0x45bc,
+    Data4: [0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2],
+  },
+  pid: 4,
+};
+// USB Test and Measurement Class (USBTMC): class FE, subclass 03
+const USBTMC_COMPATIBLE_ID = /^USB\\Class_FE&SubClass_03/i;
 const INVALID_HANDLE_VALUE = 0xffffffffffffffffn;
 const GENERIC_READ_WRITE = 0xc0000000;
 const FILE_SHARE_READ_WRITE = 0x03;
@@ -184,9 +202,12 @@ export class Win32Error extends Error {
 // --- discovery ---------------------------------------------------------------
 
 /**
- * Every N9340B on USB right now, as [{ serial, service, path }]. `service` is
- * the bound driver's service name ('WinUSB' is the one we can use; Keysight's
- * IO Libraries binds 'Usbtmc'; null means no driver). Never opens a device.
+ * Every Keysight (vendor 0x0957) USBTMC instrument on USB right now, as
+ * [{ serial, model, productId, service, path }]. Not only the N9340B: other
+ * Keysight handhelds are offered too and driven the same way. `model` is the
+ * product string the device reports ("N9340B"), or null. `service` is the
+ * bound driver's service name ('WinUSB' is driven directly; Keysight's IO
+ * Libraries binds 'Usbtmc'; null means no driver). Never opens a device.
  */
 export function listWinusbUnits() {
   const set = SetupDiGetClassDevsW(
@@ -214,7 +235,22 @@ export function listWinusbUnits() {
         continue;
       }
       const path = utf16(detail.subarray(4));
-      if (!/vid_0957&pid_ffef/i.test(path)) continue;
+      const ids = /vid_0957&pid_([0-9a-f]{4})(&mi_)?/i.exec(path);
+      // a Keysight device, and the whole device rather than one function of
+      // a composite one (those have no serial-based instance id of their own)
+      if (!ids || ids[2]) continue;
+      const type = [0];
+      const text = (property) => {
+        const buf = Buffer.alloc(1024);
+        return SetupDiGetDeviceRegistryPropertyW(set, info, property, type, buf, buf.length, required)
+          ? buf.subarray(0, required[0])
+          : null;
+      };
+
+      // a test-and-measurement instrument: Keysight also makes USB devices
+      // that are not (GPIB adapters, dongles), and those are not offered
+      const compatible = text(SPDRP_COMPATIBLEIDS)?.toString('utf16le').split('\0') ?? [];
+      if (!compatible.some((id) => USBTMC_COMPATIBLE_ID.test(id))) continue;
 
       // the instance id keeps the serial's case; the interface path lower-cases it
       const idBuf = Buffer.alloc(512);
@@ -224,20 +260,24 @@ export function listWinusbUnits() {
       // no iSerialNumber: Windows makes up a port-based id like 5&2c1a3f&0&3
       if (!serial || serial.includes('&')) continue;
 
-      const svcBuf = Buffer.alloc(256);
-      const type = [0];
-      const service = SetupDiGetDeviceRegistryPropertyW(
+      const svc = text(SPDRP_SERVICE);
+      const service = svc ? utf16(svc) || null : null;
+
+      const descBuf = Buffer.alloc(512);
+      const model = SetupDiGetDevicePropertyW(
         set,
         info,
-        SPDRP_SERVICE,
+        DEVPKEY_Device_BusReportedDeviceDesc,
         type,
-        svcBuf,
-        svcBuf.length,
-        required
+        descBuf,
+        descBuf.length,
+        required,
+        0
       )
-        ? utf16(svcBuf) || null
+        ? utf16(descBuf).trim() || null
         : null;
-      units.push({ serial, service, path });
+
+      units.push({ serial, model, productId: parseInt(ids[1], 16), service, path });
     }
   } finally {
     SetupDiDestroyDeviceInfoList(set);

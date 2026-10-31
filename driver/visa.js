@@ -80,7 +80,7 @@ const check = (what, status, session) => {
 };
 
 /**
- * Open the N9340B with this serial through VISA. Blocking: for the worker only.
+ * Open the Keysight instrument with this serial, any model, through VISA. Blocking: for the worker only.
  * Returns { resource, write, read, clear, close }.
  */
 export function openVisaDevice(serial) {
@@ -92,9 +92,9 @@ export function openVisaDevice(serial) {
     const list = [0];
     const count = [0];
     const desc = Buffer.alloc(256);
-    const found = viFindRsrc(rm, `USB?*::0x0957::0xFFEF::${serial}::?*INSTR`, list, count, desc);
+    const found = viFindRsrc(rm, `USB?*::0x0957::?*::${serial}::?*INSTR`, list, count, desc);
     if (found < 0) {
-      throw Object.assign(new VisaError(`no VISA resource for the N9340B ${serial}`, found, rm), {
+      throw Object.assign(new VisaError(`no VISA resource for the analyzer ${serial}`, found, rm), {
         code: 'NO_DEVICE',
       });
     }
