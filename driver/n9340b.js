@@ -22,8 +22,9 @@
 //   - The instrument is single-threaded: while it sweeps it answers nothing,
 //     and device_clear does not abort the sweep. A 128 s sweep (full span at
 //     10 kHz RBW) is 128 s of silence. Know the sweep time before you start.
-//   - :TRACe:FORMat REAL returns 461 little-endian IEEE-754 floats and a
-//     newline, no block header.
+//   - :TRACe:FORMat REAL returns 461 little-endian IEEE-754 floats, no block
+//     header, then a newline over LAN. Over USB there is no newline: exactly
+//     1844 bytes (seen through both Keysight VISA and raw WinUSB).
 
 export const POINT_COUNT = 461;
 export const MIN_FREQUENCY_HZ = 100_000;
@@ -338,7 +339,17 @@ export class N9340B {
       this.ioTimeoutMs,
       Math.round(sweepTimeMs * 1.5) + this.sweepOverheadMs
     );
-    const done = await this.#query(':INIT:IMM;*OPC?', timeoutMs);
+    // Trigger, then wait out the sweep with nothing in flight on the link,
+    // and only then read the "1". Blocking in a read for the whole sweep
+    // means a plugin killed mid-sweep (SoundBase quitting kills the whole
+    // process tree on Windows) aborts a USB transfer half-way, and through
+    // Keysight's driver that leaves every later read failing with
+    // VI_ERROR_IO until the analyzer is re-plugged. *OPC? still has to
+    // travel with :INIT:IMM; on its own it does not wait for the sweep.
+    const link = this.#require();
+    await link.write(':INIT:IMM;*OPC?');
+    if (sweepTimeMs > 0) await new Promise((resolve) => setTimeout(resolve, sweepTimeMs));
+    const done = (await link.read({ timeoutMs })).toString('latin1').trim();
     if (done !== '1') {
       throw new Error(`the N9340B answered "${done}" instead of 1 to *OPC?`);
     }
@@ -355,8 +366,9 @@ export class N9340B {
 }
 
 /**
- * A trace in either format. REAL is 461 little-endian float32 followed by a
- * newline; ASCii is comma-separated `-9.528974152E+01` values.
+ * A trace in either format. REAL is 461 little-endian float32, with a newline
+ * after them over LAN and none over USB; ASCii is comma-separated
+ * `-9.528974152E+01` values.
  */
 export function parseTrace(buf) {
   const binaryLength = POINT_COUNT * 4;

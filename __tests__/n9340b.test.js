@@ -11,7 +11,7 @@ import { HANDSHAKE_PREFIX } from '@soundbase/plugin-contract';
 import { startFakeN9340B } from '../driver/fake-n9340b.js';
 import { POINT_COUNT, RBW_HZ, parseTrace, snapToLadder } from '../driver/n9340b.js';
 import { setUsbBackend } from '../driver/usbtmc.js';
-import { PRODUCT, discoverDevices } from '../adapter.js';
+import { PRODUCT, discoverDevices, pointsFor, segmentsFor } from '../adapter.js';
 
 // LAN only: a real analyzer on this machine's USB must not show up in
 // discovery here. usbtmc.test.js covers USB against its own fake.
@@ -136,7 +136,7 @@ test('a host-added device opens and reports capabilities from the hardware', asy
   assert.equal(caps.maxRefLevelDbm, 30);
   assert.deepEqual(
     caps.controls.map((c) => c.id),
-    ['attenuation', 'sweepMode', 'preamp']
+    ['attenuation', 'sweepMode', 'resolution', 'preamp']
   );
   // the instrument was put into single-sweep mode and binary traces
   assert.equal(instrument.state.continuous, false);
@@ -289,6 +289,73 @@ test('sweeping produces traces whose geometry matches the effective config', asy
   assert.ok(next.body.sweepId > trace.body.sweepId, 'successive polls see successive sweeps');
 });
 
+test('slices cut the span evenly, and never narrower than the minimum span', () => {
+  assert.deepEqual(segmentsFor(470e6, 616e6, 1), [{ startHz: 470e6, stopHz: 616e6 }]);
+  const four = segmentsFor(470e6, 616e6, 4);
+  assert.equal(four.length, 4);
+  assert.equal(four[0].startHz, 470e6);
+  assert.equal(four[3].stopHz, 616e6);
+  for (let k = 1; k < 4; k++) assert.equal(four[k].startHz, four[k - 1].stopHz, 'neighbours share an edge');
+  // a value the control does not offer is standard resolution
+  assert.equal(segmentsFor(470e6, 616e6, 3).length, 1);
+  // a 3 kHz span cannot be cut into slices under the 1 kHz minimum: 2 is the most
+  assert.equal(segmentsFor(1e6, 1e6 + 3_000, 8).length, 2);
+  assert.equal(pointsFor(1), POINT_COUNT);
+  assert.equal(pointsFor(4), 4 * (POINT_COUNT - 1) + 1);
+});
+
+test('a higher resolution stitches slices into one evenly spaced trace', async (t) => {
+  // each point reads back its own frequency in MHz, so the join can be checked
+  const original = instrument.state.trace;
+  instrument.state.trace = (i) =>
+    (instrument.state.startHz + ((instrument.state.stopHz - instrument.state.startHz) * i) / (POINT_COUNT - 1)) / 1e6;
+  t.after(() => {
+    instrument.state.trace = original;
+  });
+
+  const applied = await request('POST', `${DEVICE_PATH}/configuration`, {
+    startHz: START_HZ,
+    stopHz: STOP_HZ,
+    controls: { resolution: '4' },
+  });
+  assert.equal(applied.status, 200, JSON.stringify(applied.body));
+  const points = pointsFor(4);
+  assert.equal(applied.body.controls.resolution, '4');
+  assert.equal(applied.body.pointCount, points);
+  assert.equal(applied.body.startHz, START_HZ, 'the echo is the whole span, not a slice');
+  assert.equal(applied.body.stopHz, STOP_HZ);
+  // auto RBW coupled to a quarter of the span, and four sweeps' worth of time
+  assert.ok(applied.body.resolved.sweepTimeMs >= 4 * 400, JSON.stringify(applied.body.resolved));
+
+  const sweepsBefore = instrument.state.sweepCount;
+  await request('POST', `${DEVICE_PATH}/sweep/start`);
+  t.after(() => request('POST', `${DEVICE_PATH}/sweep/stop`));
+  const trace = await request('GET', `${DEVICE_PATH}/trace`);
+  assert.equal(trace.status, 200, JSON.stringify(trace.body));
+  assert.equal(trace.body.amplitudesDbm.length, points);
+  assert.equal(trace.body.startHz, START_HZ);
+  assert.equal(trace.body.stopHz, STOP_HZ);
+  assert.ok(instrument.state.sweepCount - sweepsBefore >= 4, 'one sweep per slice');
+
+  // every point sits where the shell will draw it: no gap, no repeat at a join
+  const stepMhz = (STOP_HZ - START_HZ) / 1e6 / (points - 1);
+  trace.body.amplitudesDbm.forEach((mhz, i) => {
+    const expected = START_HZ / 1e6 + i * stepMhz;
+    assert.ok(Math.abs(mhz - expected) < 1e-3, `point ${i} read ${mhz} MHz, expected ${expected}`);
+  });
+  await request('POST', `${DEVICE_PATH}/sweep/stop`);
+
+  // back to standard: one sweep over the whole span again
+  const standard = await request('POST', `${DEVICE_PATH}/configuration`, {
+    startHz: START_HZ,
+    stopHz: STOP_HZ,
+    controls: { resolution: '1' },
+  });
+  assert.equal(standard.body.pointCount, POINT_COUNT);
+  assert.equal(instrument.state.startHz, START_HZ);
+  assert.equal(instrument.state.stopHz, STOP_HZ);
+});
+
 test('a sweep that outlasts its expected time is reported, not hung', async (t) => {
   // the fake's sweep time estimate ignores sweepDelayMs, so this is a sweep
   // the instrument said would be quick and is not: the adapter's timeout
@@ -339,10 +406,13 @@ test('a dead transport fails the device and the next operation reopens it', asyn
 });
 
 test('closing hands the front panel back in continuous sweep', async () => {
+  // at a higher resolution, so the panel must get the whole span back too
   const again = await request('POST', `${DEVICE_PATH}/configuration`, {
     startHz: START_HZ,
     stopHz: STOP_HZ,
+    controls: { resolution: '4' },
   });
+  assert.equal(instrument.state.stopHz < STOP_HZ, true, 'left on the first slice while open');
   assert.equal(again.status, 200, JSON.stringify(again.body));
   assert.equal(instrument.state.continuous, false);
   const removed = await request('DELETE', DEVICE_PATH);
@@ -353,4 +423,6 @@ test('closing hands the front panel back in continuous sweep', async () => {
     await new Promise((r) => setTimeout(r, 50));
   }
   assert.equal(instrument.state.continuous, true);
+  assert.equal(instrument.state.startHz, START_HZ);
+  assert.equal(instrument.state.stopHz, STOP_HZ);
 });

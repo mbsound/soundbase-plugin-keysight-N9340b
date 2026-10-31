@@ -35,7 +35,14 @@ soundbase-plugin.json   identity, the N9340B product, config fields
 main.js                 shell bootstrap — never edit
 adapter.js              the SoundBase contract side: open/applyConfig/sweep
 driver/vxi11.js         a minimal VXI-11 (ONC RPC) client over TCP
-driver/usbtmc.js        a minimal USBTMC client over libusb (Windows only)
+driver/usbtmc.js        a minimal USBTMC client, and the USB backend (Windows only),
+                        which routes each unit by the driver bound to it
+driver/winusb.js        SetupAPI discovery and winusb.dll through koffi; no libusb
+                        (it skips the N9340B: its only configuration is numbered 0)
+driver/visa.js          the system VISA library, for a unit on Keysight's driver
+driver/usb-worker.js    the device calls, either route, in a child process the
+                        backend can kill
+driver/fake-usb-worker.js  the worker's protocol over the fake instrument, for tests
 driver/n9340b.js        the instrument: SCPI dialect, quirks, trace parsing;
                         handed either transport, builds neither
 driver/fake-n9340b.js   a fake N9340B (VXI-11 server) for the tests

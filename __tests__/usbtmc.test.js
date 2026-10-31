@@ -71,7 +71,8 @@ test('the client frames a query and reads the identity back', async () => {
 });
 
 test('a reply longer than one transfer is reassembled until EOM', async () => {
-  // a REAL trace is 1845 bytes; ask for 100 at a time so it takes 19 transfers
+  // the fake's REAL trace is 1845 bytes (the real unit sends 1844 over USB);
+  // ask for 100 at a time so it takes 19 transfers
   const client = new UsbtmcClient({ serial: SERIAL, readChunkBytes: 100 });
   await client.connect();
   try {

@@ -23,6 +23,7 @@ import {
   MIN_REF_LEVEL_DBM,
   MAX_REF_LEVEL_DBM,
   MAX_ATTENUATION_DB,
+  MIN_SPAN_HZ,
   SWEEP_MODES,
 } from './driver/n9340b.js';
 import { Vxi11Client } from './driver/vxi11.js';
@@ -38,6 +39,13 @@ const SLOW_SWEEP_WARNING_MS = 10_000;
 
 /** What the plugin adds on top of the instrument's own sweep time estimate. */
 const SWEEP_OVERHEAD_MS = 400;
+
+/**
+ * How many slices a trace may be swept in. The N9340B measures 461 points
+ * per sweep and has no command to change that, so finer spacing over the
+ * same span means sweeping it in parts and joining them.
+ */
+export const RESOLUTIONS = [1, 2, 4, 8];
 
 const ATTENUATION_CHOICES = [
   { id: 'auto', label: 'Auto (coupled to ref level)' },
@@ -146,8 +154,8 @@ class N9340BAdapter {
       throw new Error(
         usb
           ? `Could not open the N9340B on ${this.where}: ${err.message}. ` +
-              'Check the USB cable, that no other program (such as Keysight Connection Expert) has the analyzer open, ' +
-              'and that the WinUSB driver is bound to it (see the README).'
+              'Check the USB cable and that no other program (such as Keysight Connection Expert) is using the analyzer. ' +
+              'If it keeps failing, unplug the analyzer\'s USB cable and plug it back in.'
           : `Could not reach an N9340B at ${this.where}: ${err.message}. ` +
               'Check the address, that the analyzer is on the same network, and that its LAN port is enabled.'
       );
@@ -186,6 +194,19 @@ class N9340BAdapter {
         ],
         help:
           'Fast sweeps are roughly half the time of Normal at the same RBW, at a small cost in amplitude accuracy.',
+      },
+      {
+        id: 'resolution',
+        type: 'dropdown',
+        label: 'Resolution',
+        default: '1',
+        choices: RESOLUTIONS.map((n) => ({
+          id: String(n),
+          label: n === 1 ? `Standard (${pointsFor(n)} points)` : `${n}× (${pointsFor(n)} points)`,
+        })),
+        help:
+          `The analyzer measures ${POINT_COUNT} points per sweep, whatever the span. Higher resolutions sweep the span ` +
+          'in that many slices and join them, for finer point spacing (and a matching auto RBW), at that many times the sweep time.',
       },
     ];
     if (this.hasPreamp) {
@@ -244,6 +265,7 @@ class N9340BAdapter {
       controls: { ...previous.controls },
       resolved: {},
     };
+    const controls = cfg.controls ?? {};
 
     // -- frequency range
     if (isNum(cfg.startHz) || isNum(cfg.stopHz) || !isNum(previous.startHz)) {
@@ -260,6 +282,24 @@ class N9340BAdapter {
     } else {
       effective.startHz = previous.startHz;
       effective.stopHz = previous.stopHz;
+    }
+
+    // -- resolution: the span in slices of POINT_COUNT points each. The
+    // analyzer is left on the first slice, so an auto RBW couples to a slice
+    // and the sweep time read below is one slice's.
+    const wantSlices =
+      controls.resolution !== undefined
+        ? Number(controls.resolution)
+        : Number(previous.controls.resolution ?? 1);
+    this.segments = segmentsFor(effective.startHz, effective.stopHz, wantSlices);
+    effective.controls.resolution = String(this.segments.length);
+    effective.pointCount = pointsFor(this.segments.length);
+    if (this.segments.length > 1) {
+      const first = this.segments[0];
+      await instrument.setFrequencyRange(first.startHz, first.stopHz);
+    } else if (previous.controls.resolution && previous.controls.resolution !== '1') {
+      // back from slices to the whole span in one sweep
+      await instrument.setFrequencyRange(effective.startHz, effective.stopHz);
     }
 
     // -- RBW. The shell hands us its whole desired configuration, not a
@@ -285,7 +325,6 @@ class N9340BAdapter {
     effective.resolved.refLevelDbm = refLevel;
 
     // -- controls
-    const controls = cfg.controls ?? {};
     if (controls.attenuation !== undefined || previous.controls.attenuation === undefined) {
       const want = controls.attenuation ?? 'auto';
       const atten = await instrument.setAttenuation(
@@ -311,9 +350,11 @@ class N9340BAdapter {
       effective.controls.preamp = this.preampOn ? 'on' : 'off';
     }
 
-    // -- what this costs per sweep, so the host's stall watchdog can wait
+    // -- what this costs per sweep, so the host's stall watchdog can wait.
+    // With slices, each one is a sweep of its own plus a re-tune.
     this.sweepTimeMs = await instrument.getSweepTimeMs();
-    effective.resolved.sweepTimeMs = this.sweepTimeMs + SWEEP_OVERHEAD_MS;
+    effective.resolved.sweepTimeMs =
+      this.segments.length * (this.sweepTimeMs + SWEEP_OVERHEAD_MS);
 
     this.#reportWarnings(await instrument.errors());
     this.effective = effective;
@@ -325,20 +366,24 @@ class N9340BAdapter {
         `vbw=${effective.vbwHz ?? `auto(${effective.resolved.vbwHz})`} ` +
         `ref=${effective.refLevelDbm} dBm atten=${effective.controls.attenuation}(${effective.resolved.attenuationDb} dB) ` +
         `preamp=${effective.controls.preamp ?? 'n/a'} sweep=${effective.controls.sweepMode} ` +
-        `sweepTime=${this.sweepTimeMs} ms`
+        `resolution=${this.segments.length}x(${effective.pointCount} pts) ` +
+        `sweepTime=${this.segments.length > 1 ? `${this.segments.length}x` : ''}${this.sweepTimeMs} ms`
     );
     return publicConfig(effective);
   }
 
   #reportWarnings(errors) {
     const warnings = [];
-    if (this.sweepTimeMs > SLOW_SWEEP_WARNING_MS) {
+    const slices = this.segments?.length ?? 1;
+    const traceMs = this.sweepTimeMs * slices;
+    if (traceMs > SLOW_SWEEP_WARNING_MS) {
       warnings.push({
         id: 'slow-sweep',
         severity: 'warning',
         message:
-          `One sweep takes ${(this.sweepTimeMs / 1000).toFixed(0)} s at this span and RBW. ` +
-          'Widen the RBW, narrow the span, or choose the Fast sweep mode for a live view.',
+          `One trace takes ${(traceMs / 1000).toFixed(0)} s at this span and RBW` +
+          (slices > 1 ? ` (${slices} slices)` : '') +
+          '. Widen the RBW, narrow the span, lower the resolution, or choose the Fast sweep mode for a live view.',
       });
     }
     if (errors.some((e) => e.code === 130)) {
@@ -374,9 +419,7 @@ class N9340BAdapter {
         try {
           const amplitudes = await this.exclusive(() => {
             if (!this.sweeping) return null;
-            return this.#requireInstrument().sweep({
-              sweepTimeMs: this.sweepTimeMs,
-            });
+            return this.#sweepOnce();
           });
           if (this.sweeping && amplitudes) onTrace(amplitudes);
         } catch (err) {
@@ -393,6 +436,25 @@ class N9340BAdapter {
     })();
   }
 
+  /**
+   * One trace. With slices, tune to each in turn, sweep it, and join them:
+   * neighbouring slices share their edge frequency, so every slice after the
+   * first drops its first point and the joined trace stays evenly spaced.
+   */
+  async #sweepOnce() {
+    const instrument = this.#requireInstrument();
+    const segments = this.segments ?? [];
+    if (segments.length <= 1) return instrument.sweep({ sweepTimeMs: this.sweepTimeMs });
+    const trace = [];
+    for (const [i, segment] of segments.entries()) {
+      await instrument.setFrequencyRange(segment.startHz, segment.stopHz);
+      const part = await instrument.sweep({ sweepTimeMs: this.sweepTimeMs });
+      trace.push(...(i === 0 ? part : part.slice(1)));
+      if (!this.sweeping) return null;
+    }
+    return trace;
+  }
+
   async stopSweep() {
     this.sweeping = false;
   }
@@ -404,8 +466,14 @@ class N9340BAdapter {
     const instrument = this.instrument;
     this.instrument = null;
     if (!instrument) return;
+    const full = this.effective;
+    const sliced = (this.segments?.length ?? 1) > 1;
     await this.exclusive(async () => {
       if (instrument.connected) {
+        // the front panel gets the whole span back, not the last slice
+        if (sliced && full) {
+          await instrument.setFrequencyRange(full.startHz, full.stopHz).catch(() => {});
+        }
         await instrument.restoreContinuous().catch(() => {});
       }
       await instrument.close();
@@ -418,6 +486,24 @@ class N9340BAdapter {
     }
     return this.instrument;
   }
+}
+
+/** How many points a trace of this many slices has: neighbours share an edge. */
+export const pointsFor = (slices) => slices * (POINT_COUNT - 1) + 1;
+
+/**
+ * The span cut into `slices` equal parts, as [{ startHz, stopHz }]. Clamped
+ * to what RESOLUTIONS offers and to slices no narrower than the analyzer's
+ * minimum span; one slice is the span itself.
+ */
+export function segmentsFor(startHz, stopHz, slices) {
+  const span = stopHz - startHz;
+  const wanted = RESOLUTIONS.includes(slices) ? slices : 1;
+  const n = RESOLUTIONS.filter((r) => r <= wanted && span / r >= MIN_SPAN_HZ).pop() ?? 1;
+  return Array.from({ length: n }, (_, k) => ({
+    startHz: Math.round(startHz + (span * k) / n),
+    stopHz: Math.round(startHz + (span * (k + 1)) / n),
+  }));
 }
 
 /** A copy the shell can keep without sharing our bookkeeping objects. */

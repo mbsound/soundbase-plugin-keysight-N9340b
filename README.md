@@ -22,14 +22,26 @@ no native code.
 honours, what it clamps and snaps, how long a sweep takes, and how to read a
 trace. `adapter.js` maps that onto the SoundBase contract.
 
-USB: `driver/usbtmc.js` is a small USBTMC (USB488) client over libusb (the
-optional `usb` package). It is **Windows only**. The N9340B's configuration
-descriptor declares `bConfigurationValue` 0 and the unit rejects
-`SET_CONFIGURATION(1)`, so macOS never creates an interface for it and no
-program can open it there. A.02.07 is the final firmware, so this will not
-change. On Windows the analyzer needs the WinUSB driver bound to it (see
-below); Keysight's own USB driver from IO Libraries Suite is a different
-driver and libusb cannot use it.
+USB: `driver/usbtmc.js` is a small USBTMC (USB488) client. It is **Windows
+only**. It works with whichever of two drivers Windows has bound to the
+analyzer:
+
+- **WinUSB** (Microsoft's): the plugin calls `winusb.dll` directly.
+- **Keysight's USBTMC driver** (from IO Libraries Suite): the plugin goes
+  through the VISA library that IO Libraries installs with it. Nothing to
+  change; Keysight Connection Expert keeps working, though only one program
+  can talk to the analyzer at a time.
+
+Both are called through `koffi`, which ships prebuilt, so nothing is compiled
+on install, and the device calls run in a worker process the plugin kills if
+one hangs. The device id is `usb:<serial>` on either driver, so a project
+keeps working if the driver changes.
+
+The N9340B's configuration descriptor declares `bConfigurationValue` 0 and the
+unit rejects `SET_CONFIGURATION(1)`, so macOS never creates an interface for
+it and no program can open it there; libusb ignores it on every OS for the
+same reason. A.02.07 is the final firmware, so this will not change. Windows'
+own USB stack does not mind.
 
 ## Using it
 
@@ -45,15 +57,24 @@ driver and libusb cannot use it.
 
 ### Over USB (Windows)
 
-1. Bind WinUSB to the analyzer once per PC: run [Zadig](https://zadig.akeo.ie),
-   choose **Options > List All Devices**, pick the device with USB ID
-   `0957 FFEF`, select **WinUSB** and click **Install Driver**. This replaces
-   any Keysight driver for that unit on that PC, so Keysight Connection
-   Expert will no longer see it over USB (LAN is unaffected).
+1. Give the analyzer a driver, once per PC. Either:
+   - **Keysight IO Libraries Suite is installed:** nothing to do. Its driver
+     is already bound, and the plugin uses it through VISA.
+   - **Otherwise, bind Microsoft's WinUSB driver** (needs an administrator):
+     plug the analyzer in, then in **Device Manager** right-click **N9340B**
+     (shown with a warning, no driver) and choose **Update driver > Browse my
+     computer for drivers > Let me pick from a list > Universal Serial Bus
+     devices > WinUsb Device > WinUsb Device > Next**, and accept the warning.
 2. Plug the analyzer in. It appears in the device picker by itself as
    **N9340B <serial> (USB)**, with the device id `usb:<serial>`, which stays
-   the same whichever port you use.
+   the same whichever port or driver you use. There is nothing to fill in.
 3. Press **Live**.
+
+While SoundBase has the analyzer open, other programs (Keysight Connection
+Expert included) cannot use it over USB, and the other way round.
+
+After moving the analyzer from one driver to the other, restart the PC before
+using Keysight VISA again; until then it can fail with `VI_ERROR_ALLOC`.
 
 A unit cabled both ways shows up twice, once per transport; use either.
 
