@@ -124,7 +124,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION=$(node -p "require('koffi/package.json').version")
+          # from the lockfile: koffi's `exports` map does not expose package.json
+          VERSION=$(node -p "require('./package-lock.json').packages['node_modules/koffi'].version")
           DEST=node_modules/@koromix/koffi-win32-x64
           TARBALL=$(npm pack "@koromix/koffi-win32-x64@$VERSION" --silent)
           mkdir -p "$DEST"
